@@ -1,123 +1,106 @@
-// vanguard-backend server.js
-// - Relays control events from web clients to the Vanguard ESP32
-// - Maintains a simple Park lock state so motors are ignored while parked
-// - Broadcasts telemetry to all connected web clients
-
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
+// server.js (Socket.IO + raw WebSocket bridge)
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
+
+// Socket.IO for web clients
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: { origin: '*' }
 });
 
-// Keep track of the connected Vanguard socket and park state
-let vanguardSocket = null;
-let parkState = {
-  // single vanguard instance assumed; extendable by id
-  vanguard: true // default parked for safety; set false to allow movement
-};
+// Keep track of the connected Vanguard raw websocket
+let vanguardWs = null;
+let parkState = { vanguard: true };
 
-// Simple HTTP health endpoint
-app.get("/", (req, res) => res.send("Vanguard backend running"));
+app.get('/', (req, res) => res.send('Vanguard backend running'));
 
-io.on("connection", (socket) => {
-  console.log("client connected", socket.id);
+// Socket.IO connections (web clients)
+io.on('connection', (socket) => {
+  console.log('web client connected', socket.id);
 
-  // Web clients and ESP32 should call identify after connecting
-  socket.on("identify", (data) => {
-    if (!data || !data.role) return;
-    if (data.role === "vanguard") {
-      vanguardSocket = socket;
-      console.log("Vanguard identified:", socket.id);
-      // When Vanguard connects, send current park state to it
-      socket.emit("server_message", { type: "park_state", parked: !!parkState.vanguard });
-    } else if (data.role === "web") {
-      console.log("Web client identified:", socket.id);
-      // send current park state to the web client so UI can reflect it
-      socket.emit("server_message", { type: "park_state", parked: !!parkState.vanguard });
-    }
+  socket.on('identify', (data) => {
+    console.log('web identify', data);
+    // send current park state to web client
+    socket.emit('server_message', { type: 'park_state', parked: !!parkState.vanguard });
   });
 
-  // Web clients send control events
-  socket.on("control", (msg) => {
+  socket.on('control', (msg) => {
     try {
-      // Basic validation
-      if (!msg || typeof msg !== "object") return;
-      // If this is a park/gear command, update server state and broadcast
-      if (msg.type === "gear" && msg.gear === "park") {
+      if (!msg || typeof msg !== 'object') return;
+
+      // handle park/gear state on server
+      if (msg.type === 'gear' && msg.gear === 'park') {
         parkState.vanguard = true;
-        io.emit("server_message", { type: "park_state", parked: true });
-        console.log("Park engaged by web client");
-        // forward to vanguard so it can stop motors locally
-        if (vanguardSocket) vanguardSocket.send(JSON.stringify({ type: "gear", gear: "park" }));
+        io.emit('server_message', { type: 'park_state', parked: true });
+        if (vanguardWs && vanguardWs.readyState === WebSocket.OPEN) {
+          vanguardWs.send(JSON.stringify({ type: 'gear', gear: 'park' }));
+        }
         return;
       }
-      if (msg.type === "gear" && msg.gear === "forward") {
-        // forward gear implies unpark
+      if (msg.type === 'gear' && (msg.gear === 'forward' || msg.gear === 'reverse')) {
         parkState.vanguard = false;
-        io.emit("server_message", { type: "park_state", parked: false });
-      }
-      if (msg.type === "gear" && msg.gear === "reverse") {
-        parkState.vanguard = false;
-        io.emit("server_message", { type: "park_state", parked: false });
-      }
-      if (msg.type === "gear" && msg.gear === "neutral") {
-        // neutral does not change park state
+        io.emit('server_message', { type: 'park_state', parked: false });
       }
 
-      // If the command is motor movement, enforce park lock on server
-      if (msg.type === "motor" || msg.type === "steer_start" || msg.type === "steer_tick" || msg.type === "steer_tap") {
-        if (parkState.vanguard) {
-          // ignore motor/steer commands while parked
-          console.log("Ignored motor/steer command while parked:", msg);
-          // Optionally notify the sender
-          socket.emit("server_message", { type: "error", message: "Vanguard is parked. Unpark to move." });
-          return;
-        }
+      // enforce park lock on server for motor/steer commands
+      if (['motor','steer_start','steer_tick','steer_tap'].includes(msg.type) && parkState.vanguard) {
+        socket.emit('server_message', { type: 'error', message: 'Vanguard is parked. Unpark to move.' });
+        return;
       }
 
-      // Relay everything else to Vanguard if connected
-      if (vanguardSocket) {
-        // send as raw JSON string to the vanguard socket
-        vanguardSocket.send(JSON.stringify(msg));
-        console.log("Relayed to vanguard:", msg);
+      // Relay to vanguard raw websocket if connected
+      if (vanguardWs && vanguardWs.readyState === WebSocket.OPEN) {
+        vanguardWs.send(JSON.stringify(msg));
       } else {
-        console.log("No vanguard connected; control ignored:", msg);
-        socket.emit("server_message", { type: "error", message: "Vanguard not connected" });
+        socket.emit('server_message', { type: 'error', message: 'Vanguard not connected' });
       }
     } catch (e) {
-      console.error("control handler error", e);
+      console.error('control handler error', e);
     }
   });
+});
 
-  // Vanguard may send telemetry as raw messages (stringified JSON)
-  socket.on("message", (m) => {
+// Raw WebSocket server for ESP32 (and other raw WS clients)
+const wss = new WebSocket.Server({ server, path: '/vanguard-ws' });
+
+wss.on('connection', (ws, req) => {
+  console.log('raw websocket connected from', req.socket.remoteAddress);
+
+  // mark this as the vanguard connection (replace existing)
+  vanguardWs = ws;
+  // send current park state to vanguard
+  ws.send(JSON.stringify({ type: 'server_message', subtype: 'park_state', parked: !!parkState.vanguard }));
+
+  ws.on('message', (message) => {
+    // Expect JSON string from ESP32
     try {
-      const obj = typeof m === "string" ? JSON.parse(m) : m;
-      if (obj && obj.type === "telemetry") {
-        // Broadcast telemetry to all web clients
-        io.emit("telemetry", obj);
+      const obj = JSON.parse(message.toString());
+      // If telemetry, broadcast to web clients via socket.io
+      if (obj && obj.type === 'telemetry') {
+        io.emit('telemetry', obj);
       } else {
-        // handle other messages from vanguard if needed
-        io.emit("server_message", obj);
+        // forward other messages to web clients as server_message
+        io.emit('server_message', obj);
       }
     } catch (e) {
-      console.warn("Invalid message payload", e);
+      console.warn('Invalid JSON from vanguard:', e);
     }
   });
 
-  socket.on("disconnect", (reason) => {
-    console.log("socket disconnected", socket.id, reason);
-    if (vanguardSocket && socket.id === vanguardSocket.id) {
-      vanguardSocket = null;
-      console.log("Vanguard disconnected");
-      // Optionally set park to true for safety
-      parkState.vanguard = true;
-      io.emit("server_message", { type: "park_state", parked: true });
-    }
+  ws.on('close', () => {
+    console.log('vanguard raw websocket disconnected');
+    if (vanguardWs === ws) vanguardWs = null;
+    // set park for safety
+    parkState.vanguard = true;
+    io.emit('server_message', { type: 'park_state', parked: true });
+  });
+
+  ws.on('error', (err) => {
+    console.warn('vanguard ws error', err);
   });
 });
 
