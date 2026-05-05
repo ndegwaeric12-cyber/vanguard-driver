@@ -80,6 +80,7 @@ ws.on('message', (message) => {
   try {
     const obj = JSON.parse(message.toString());
     if (obj && obj.type === 'telemetry') {
+      console.log('EMITTING_TELEMETRY_TO_WEB:', JSON.stringify(obj));
       io.emit('telemetry', obj);
     } else {
       io.emit('server_message', obj);
