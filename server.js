@@ -75,21 +75,20 @@ wss.on('connection', (ws, req) => {
   // send current park state to vanguard
   ws.send(JSON.stringify({ type: 'server_message', subtype: 'park_state', parked: !!parkState.vanguard }));
 
-  ws.on('message', (message) => {
-    // Expect JSON string from ESP32
-    try {
-      const obj = JSON.parse(message.toString());
-      // If telemetry, broadcast to web clients via socket.io
-      if (obj && obj.type === 'telemetry') {
-        io.emit('telemetry', obj);
-      } else {
-        // forward other messages to web clients as server_message
-        io.emit('server_message', obj);
-      }
-    } catch (e) {
-      console.warn('Invalid JSON from vanguard:', e);
+ws.on('message', (message) => {
+  console.log('RAW_WS_INCOMING:', message.toString());
+  try {
+    const obj = JSON.parse(message.toString());
+    if (obj && obj.type === 'telemetry') {
+      io.emit('telemetry', obj);
+    } else {
+      io.emit('server_message', obj);
     }
-  });
+  } catch (e) {
+    console.warn('Invalid JSON from vanguard:', e);
+  }
+});
+
 
   ws.on('close', () => {
     console.log('vanguard raw websocket disconnected');
