@@ -1,30 +1,20 @@
 // ======================================================
-// VANGUARD RAW WEBSOCKET SERVER
-// ======================================================
-// Install:
-// npm install express ws
-//
-// Run:
-// node server.js
-//
-// WebSocket endpoint:
-// ws://localhost:3000/vanguard-ws
+// VANGUARD BACKEND SERVER
 // ======================================================
 
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 
-// ======================================================
-// EXPRESS + HTTP SERVER
-// ======================================================
-
 const app = express();
 const server = http.createServer(app);
 
-// Health route
+// ======================================================
+// BASIC ROUTE
+// ======================================================
+
 app.get('/', (req, res) => {
-  res.send('vanguard-driver backend running');
+  res.send('Vanguard backend running');
 });
 
 // ======================================================
@@ -37,20 +27,16 @@ const wss = new WebSocket.Server({
 });
 
 // ======================================================
-// CLIENT STORAGE
+// STORAGE
 // ======================================================
 
-// Connected browsers
 const browserClients = new Set();
-
-// Connected ESP32/device clients
 const deviceClients = new Set();
 
-// Latest telemetry by device
 const telemetryStore = {};
 
 // ======================================================
-// SAFE SEND FUNCTION
+// SAFE SEND
 // ======================================================
 
 function safeSend(client, data) {
@@ -74,16 +60,16 @@ function safeSend(client, data) {
 }
 
 // ======================================================
-// BROADCAST HELPERS
+// BROADCASTERS
 // ======================================================
 
 function broadcastToBrowsers(data) {
 
   browserClients.forEach((client) => {
 
-    const success = safeSend(client, data);
+    const ok = safeSend(client, data);
 
-    if (!success) {
+    if (!ok) {
       browserClients.delete(client);
     }
 
@@ -95,9 +81,9 @@ function broadcastToDevices(data) {
 
   deviceClients.forEach((client) => {
 
-    const success = safeSend(client, data);
+    const ok = safeSend(client, data);
 
-    if (!success) {
+    if (!ok) {
       deviceClients.delete(client);
     }
 
@@ -106,24 +92,18 @@ function broadcastToDevices(data) {
 }
 
 // ======================================================
-// NEW CONNECTION
+// CONNECTION
 // ======================================================
 
 wss.on('connection', (ws, req) => {
 
-  const remote =
-    req.socket.remoteAddress +
-    ':' +
-    req.socket.remotePort;
+  console.log('NEW_CONNECTION');
 
-  console.log('NEW_CONNECTION:', remote);
-
-  // Client info
   ws.clientType = null;
   ws.deviceId = null;
 
   // ====================================================
-  // RECEIVE MESSAGE
+  // MESSAGE
   // ====================================================
 
   ws.on('message', (message) => {
@@ -132,38 +112,29 @@ wss.on('connection', (ws, req) => {
 
     let obj;
 
-    // --------------------------------------------------
-    // SAFE JSON PARSE
-    // --------------------------------------------------
-
     try {
 
       obj = JSON.parse(message.toString());
 
     } catch (err) {
 
-      console.error('INVALID_JSON');
-
-      safeSend(ws, {
-        type: 'server_error',
-        error: 'invalid_json'
-      });
+      console.log('INVALID_JSON');
 
       return;
     }
 
-    // --------------------------------------------------
-    // IDENTIFY CLIENT
-    // --------------------------------------------------
+    // ==================================================
+    // IDENTIFY
+    // ==================================================
 
     if (
       !ws.clientType &&
       obj.type === 'identify'
     ) {
 
-      // ================================================
-      // BROWSER CLIENT
-      // ================================================
+      // ----------------------------------------------
+      // BROWSER
+      // ----------------------------------------------
 
       if (obj.client === 'browser') {
 
@@ -173,19 +144,19 @@ wss.on('connection', (ws, req) => {
 
         console.log('BROWSER_CONNECTED');
 
-        // Send all latest telemetry
-        Object.values(telemetryStore).forEach((telemetry) => {
+        // Send latest telemetry
+        Object.values(telemetryStore).forEach((t) => {
 
-          safeSend(ws, telemetry);
+          safeSend(ws, t);
 
         });
 
         return;
       }
 
-      // ================================================
-      // DEVICE CLIENT
-      // ================================================
+      // ----------------------------------------------
+      // DEVICE
+      // ----------------------------------------------
 
       if (obj.client === 'device') {
 
@@ -212,19 +183,17 @@ wss.on('connection', (ws, req) => {
 
     }
 
-    // --------------------------------------------------
-    // DEVICE TELEMETRY
-    // --------------------------------------------------
+    // ==================================================
+    // TELEMETRY
+    // ==================================================
 
     if (
       ws.clientType === 'device' &&
       obj.type === 'telemetry'
     ) {
 
-      // Attach deviceId automatically
       obj.deviceId = ws.deviceId;
 
-      // Save latest telemetry
       telemetryStore[ws.deviceId] = obj;
 
       console.log(
@@ -232,15 +201,14 @@ wss.on('connection', (ws, req) => {
         JSON.stringify(obj)
       );
 
-      // Broadcast to all browsers
       broadcastToBrowsers(obj);
 
       return;
     }
 
-    // --------------------------------------------------
-    // CONTROL COMMAND FROM BROWSER
-    // --------------------------------------------------
+    // ==================================================
+    // CONTROL COMMANDS
+    // ==================================================
 
     if (
       ws.clientType === 'browser' &&
@@ -248,44 +216,24 @@ wss.on('connection', (ws, req) => {
     ) {
 
       console.log(
-        'CONTROL_COMMAND:',
+        'CONTROL:',
         JSON.stringify(obj)
       );
 
-      // Send command to all devices
       broadcastToDevices(obj);
 
       return;
     }
 
-    // --------------------------------------------------
-    // UNKNOWN MESSAGE TYPE
-    // --------------------------------------------------
-
-    console.log(
-      'UNKNOWN_MESSAGE:',
-      JSON.stringify(obj)
-    );
-
-    safeSend(ws, {
-      type: 'server_error',
-      error: 'unknown_message_type'
-    });
-
   });
 
   // ====================================================
-  // CLIENT DISCONNECT
+  // CLOSE
   // ====================================================
 
-  ws.on('close', (code, reason) => {
+  ws.on('close', () => {
 
-    console.log(
-      'CLIENT_DISCONNECTED:',
-      remote,
-      'CODE:',
-      code
-    );
+    console.log('CLIENT_DISCONNECTED');
 
     browserClients.delete(ws);
     deviceClients.delete(ws);
@@ -293,7 +241,7 @@ wss.on('connection', (ws, req) => {
   });
 
   // ====================================================
-  // CONNECTION ERROR
+  // ERROR
   // ====================================================
 
   ws.on('error', (err) => {
@@ -334,10 +282,7 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
 
   console.log('=================================');
-  console.log(`SERVER RUNNING ON PORT ${PORT}`);
-  console.log(
-    `WS ENDPOINT: ws://localhost:${PORT}/vanguard-ws`
-  );
+  console.log(`SERVER RUNNING ON ${PORT}`);
   console.log('=================================');
 
 });
