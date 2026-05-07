@@ -1,121 +1,133 @@
-// server.js
-// Minimal Node.js server bridging a raw WebSocket endpoint (/vanguard-ws)
-// to Socket.IO web clients. Includes safe JSON parsing and temporary debug logs.
-//
-// Install dependencies:
-//   npm install express http ws socket.io
-
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws'); // ws library
-const { Server: IOServer } = require('socket.io');
+const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
-const io = new IOServer(server);
 
-// Simple health route
-app.get('/', (req, res) => res.send('vanguard-driver backend running'));
-
-// --- WebSocket server for raw device connections (ESP32) ---
-const wss = new WebSocket.Server({ noServer: true, path: '/vanguard-ws' });
-
-// Keep track of the latest telemetry (optional)
-let lastTelemetry = null;
-
-// When an HTTP upgrade request comes in, route to the ws server if path matches
-server.on('upgrade', (request, socket, head) => {
-  if (request.url === '/vanguard-ws') {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
-  } else {
-    socket.destroy();
-  }
+app.get('/', (req, res) => {
+  res.send('vanguard-driver backend running');
 });
 
-// Handle raw WS connections
-wss.on('connection', (rawWs, req) => {
-  const remote = req.socket.remoteAddress + ':' + req.socket.remotePort;
-  console.log('RAW_WS_CONNECTED from', remote);
+// Main WebSocket server
+const wss = new WebSocket.Server({
+  server,
+  path: '/vanguard-ws'
+});
 
-  rawWs.on('message', (message) => {
-    // Debug: log raw incoming message
-    console.log('RAW_WS_INCOMING:', message.toString());
+// Store latest telemetry
+let lastTelemetry = null;
 
-    // Parse JSON safely
+// Store connected browser clients separately
+const browserClients = new Set();
+
+// Store connected devices separately
+const deviceClients = new Set();
+
+wss.on('connection', (ws, req) => {
+
+  console.log('NEW_WS_CONNECTION');
+
+  // Identify client type
+  ws.clientType = null;
+
+  ws.on('message', (message) => {
+
     let obj;
+
     try {
       obj = JSON.parse(message.toString());
     } catch (err) {
-      console.error('RAW_WS_JSON_PARSE_ERROR:', err.message);
-      // Optionally reply with an error
-      try { rawWs.send(JSON.stringify({ type: 'server_message', error: 'invalid_json' })); } catch (e) {}
+      console.error('INVALID_JSON');
       return;
     }
 
-    // Example: if telemetry, store and emit to web clients
-    if (obj && obj.type === 'telemetry') {
-      lastTelemetry = obj;
-      // Emit to all connected socket.io clients
-      io.emit('telemetry', obj);
+    // First message should identify client
+    if (!ws.clientType && obj.type === 'identify') {
 
-      // Debug: log what we emitted
-      console.log('EMITTING_TELEMETRY_TO_WEB:', JSON.stringify(obj));
-      return;
-    }
+      if (obj.client === 'browser') {
+        ws.clientType = 'browser';
+        browserClients.add(ws);
 
-    // Example: forward other messages to web clients as-is
-    io.emit('raw_ws_message', obj);
-    console.log('EMITTING_RAW_WS_MESSAGE_TO_WEB:', JSON.stringify(obj));
-  });
+        console.log('BROWSER_CONNECTED');
 
-  rawWs.on('close', (code, reason) => {
-    console.log('RAW_WS_DISCONNECTED', remote, 'code=', code, 'reason=', reason && reason.toString());
-  });
-
-  rawWs.on('error', (err) => {
-    console.error('RAW_WS_ERROR from', remote, err && err.message);
-  });
-
-  // Optionally accept control messages from web clients and forward to device
-  // (Handled below via socket.io)
-});
-
-// --- Socket.IO for browser/web clients ---
-io.on('connection', (socket) => {
-  console.log('WEB_CLIENT_CONNECTED:', socket.id);
-
-  // Provide last telemetry on connect
-  if (lastTelemetry) {
-    socket.emit('telemetry', lastTelemetry);
-  }
-
-  // When web client sends a control message, forward to all raw WS clients
-  socket.on('control', (msg) => {
-    // msg expected to be a JSON-serializable object
-    console.log('WEB_CONTROL_INCOMING from', socket.id, JSON.stringify(msg));
-
-    // Broadcast to all connected raw WS clients
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        try {
-          client.send(JSON.stringify(msg));
-        } catch (err) {
-          console.error('ERROR_SENDING_TO_RAW_WS:', err.message);
+        // Send latest telemetry immediately
+        if (lastTelemetry) {
+          ws.send(JSON.stringify(lastTelemetry));
         }
+
+      } else if (obj.client === 'device') {
+
+        ws.clientType = 'device';
+        deviceClients.add(ws);
+
+        console.log('DEVICE_CONNECTED');
       }
-    });
+
+      return;
+    }
+
+    // DEVICE TELEMETRY
+    if (
+      ws.clientType === 'device' &&
+      obj.type === 'telemetry'
+    ) {
+
+      lastTelemetry = obj;
+
+      console.log('TELEMETRY:', obj);
+
+      // Broadcast to browsers
+      browserClients.forEach((client) => {
+
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(obj));
+        }
+
+      });
+
+      return;
+    }
+
+    // BROWSER CONTROL COMMANDS
+    if (
+      ws.clientType === 'browser' &&
+      obj.type === 'control'
+    ) {
+
+      console.log('CONTROL_COMMAND:', obj);
+
+      // Send to all devices
+      deviceClients.forEach((client) => {
+
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(obj));
+        }
+
+      });
+
+      return;
+    }
+
   });
 
-  socket.on('disconnect', (reason) => {
-    console.log('WEB_CLIENT_DISCONNECTED:', socket.id, reason);
+  ws.on('close', () => {
+
+    browserClients.delete(ws);
+    deviceClients.delete(ws);
+
+    console.log('CLIENT_DISCONNECTED');
+
   });
+
+  ws.on('error', (err) => {
+    console.error('WS_ERROR:', err.message);
+  });
+
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-  console.log('Raw WS path: /vanguard-ws');
+  console.log(`Server running on ${PORT}`);
 });
